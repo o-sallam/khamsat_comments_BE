@@ -1,32 +1,29 @@
-# Use Node.js LTS
-FROM node:18-alpine
+# Use Node.js LTS with a full Debian-based image for better compatibility
+FROM node:18-bullseye
 
 # Set working directory
 WORKDIR /app
 
 # Install system dependencies
-RUN apk add --no-cache \
-    chromium \
-    nss \
-    freetype \
-    harfbuzz \
-    ca-certificates \
-    ttf-freefont \
-    && rm -rf /var/cache/apk/*
+RUN apt-get update && apt-get install -y \
+    wget \
+    && rm -rf /var/lib/apt/lists/*
 
-# Set environment variables for Playwright
-ENV PUPPETEER_SKIP_CHROMIUM_DOWNLOAD=true \
-    PUPPETEER_EXECUTABLE_PATH=/usr/bin/chromium-browser \
-    PLAYWRIGHT_BROWSERS_PATH=/ms-playwright
+# Install Playwright and its dependencies
+RUN npm init -y && \
+    npm install @playwright/test
 
 # Copy package files
 COPY package*.json ./
 
 # Install Node.js dependencies
-RUN npm install --production
+RUN npm install
 
 # Install Playwright browsers
 RUN npx playwright install --with-deps chromium
+
+# Set environment variables
+ENV PLAYWRIGHT_BROWSERS_PATH=/ms-playwright
 
 # Copy application code
 COPY . .
