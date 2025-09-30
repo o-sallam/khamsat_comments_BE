@@ -1,7 +1,5 @@
-# Use a single stage build for Railway
 FROM node:18-bullseye-slim
 
-# Install Playwright system dependencies
 RUN apt-get update && apt-get install -y \
     wget \
     ca-certificates \
@@ -30,24 +28,16 @@ RUN apt-get update && apt-get install -y \
 
 WORKDIR /app
 
-# Copy package files first for better caching
 COPY package*.json ./
-
-# Install dependencies
 RUN npm install --omit=dev
 
-# Copy application code BEFORE installing Playwright
-COPY . .
-
-# Install Playwright and Chromium browser AFTER copying app code
-# This ensures browsers are installed in the correct location
 RUN npx playwright install chromium --with-deps
 
-# Set environment variables for Railway
-ENV NODE_ENV=production
+COPY . .
 
-# Railway uses PORT environment variable
+ENV NODE_ENV=production
+ENV NODE_OPTIONS="--max-old-space-size=2048"
+
 EXPOSE ${PORT:-3001}
 
-# Use PORT from Railway or default to 3001
 CMD node server.js

@@ -18,10 +18,11 @@ const CACHE_DURATION = 10 * 60 * 1000; // 10 minutes
 let browserInstance = null;
 let browserContext = null;
 let browserInitializing = false;
-const PAGE_POOL_SIZE = 5; // Pre-warmed pages
-const pagePool = [];
-const MAX_TABS = 10;
-const activeTabs = new Map();
+
+// CRITICAL: Limit concurrent scraping for Railway
+const MAX_CONCURRENT_SCRAPES = 3; // Railway can't handle more than 3 concurrent
+let activeScrapes = 0;
+const scrapeQueue = [];
 
 // Initialize browser with Playwright
 async function initBrowser() {
@@ -46,25 +47,21 @@ async function initBrowser() {
         "--no-sandbox",
         "--disable-setuid-sandbox",
         "--disable-dev-shm-usage",
+        "--disable-gpu",
+        "--single-process", // CRITICAL for Railway
+        "--no-zygote",
         "--disable-blink-features=AutomationControlled",
         "--disable-background-networking",
         "--disable-background-timer-throttling",
-        "--disable-backgrounding-occluded-windows",
         "--disable-breakpad",
-        "--disable-component-extensions-with-background-pages",
         "--disable-extensions",
         "--disable-features=TranslateUI",
-        "--disable-ipc-flooding-protection",
         "--disable-renderer-backgrounding",
-        "--enable-features=NetworkService,NetworkServiceInProcess",
-        "--no-default-browser-check",
         "--no-first-run",
-        "--no-zygote",
-        "--disable-gpu",
       ],
     });
 
-    // Create persistent context (faster than creating context per page)
+    // Create persistent context
     browserContext = await browserInstance.newContext({
       userAgent: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
       viewport: { width: 1366, height: 768 },
@@ -73,16 +70,14 @@ async function initBrowser() {
         "accept-language": "ar,en-US;q=0.9,en;q=0.8",
         "accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
       },
-      // Disable images, fonts for speed
       ignoreHTTPSErrors: true,
     });
 
     browserInstance.on("disconnected", () => {
-      console.warn("⚠️  Browser disconnected");
+      console.warn("⚠️  Browser disconnected - will reinitialize on next request");
       browserInstance = null;
       browserContext = null;
-      activeTabs.clear();
-      pagePool.length = 0;
+      activeScrapes = 0;
     });
 
     console.log("✅ Playwright browser initialized");
@@ -99,12 +94,11 @@ async function initBrowser() {
 
 // Configure page for fast scraping
 async function configurePage(page) {
-  // Block unnecessary resources (Playwright route method)
+  // Block unnecessary resources
   await page.route("**/*", (route) => {
     const resourceType = route.request().resourceType();
     const url = route.request().url();
     
-    // Block unnecessary resources
     if (
       resourceType === "image" ||
       resourceType === "media" ||
@@ -124,19 +118,14 @@ async function configurePage(page) {
     }
   });
 
-  // Set extra properties to avoid detection
+  // Anti-detection
   await page.addInitScript(() => {
-    // Override navigator properties
     Object.defineProperty(navigator, "webdriver", {
       get: () => false,
     });
     
-    // Add chrome property
-    window.chrome = {
-      runtime: {},
-    };
+    window.chrome = { runtime: {} };
     
-    // Override permissions
     const originalQuery = window.navigator.permissions.query;
     window.navigator.permissions.query = (parameters) =>
       parameters.name === "notifications"
@@ -145,149 +134,116 @@ async function configurePage(page) {
   });
 }
 
-// Pre-warm pages pool
-async function warmupPagePool() {
-  await initBrowser();
-  console.log(`🔥 Warming up ${PAGE_POOL_SIZE} pages...`);
-  
-  for (let i = 0; i < PAGE_POOL_SIZE; i++) {
-    try {
-      const page = await browserContext.newPage();
-      await configurePage(page);
-      pagePool.push(page);
-      console.log(`   Page ${i + 1}/${PAGE_POOL_SIZE} ready`);
-    } catch (error) {
-      console.error(`Failed to warm up page ${i + 1}:`, error);
-    }
+// Queue management - CRITICAL for Railway stability
+async function waitForSlot() {
+  while (activeScrapes >= MAX_CONCURRENT_SCRAPES) {
+    await new Promise(resolve => setTimeout(resolve, 200));
   }
-  
-  console.log(`✅ Page pool ready with ${pagePool.length} pages`);
+  activeScrapes++;
+  console.log(`🔄 Active scrapes: ${activeScrapes}/${MAX_CONCURRENT_SCRAPES}`);
 }
 
-// Get a page from pool or create new one
-async function getPage() {
-  // Try to get from pool first (fastest)
-  if (pagePool.length > 0) {
-    const page = pagePool.pop();
-    try {
-      // Quick check if page is still valid
-      if (!page.isClosed()) {
-        return { page, fromPool: true };
-      }
-    } catch (error) {
-      console.error("Pool page error:", error);
-    }
-  }
-
-  // Create new page if pool empty
-  await initBrowser();
-  
-  if (activeTabs.size >= MAX_TABS) {
-    throw new Error("Too many active tabs, please retry");
-  }
-
-  const page = await browserContext.newPage();
-  await configurePage(page);
-  return { page, fromPool: false };
+function releaseSlot() {
+  activeScrapes = Math.max(0, activeScrapes - 1);
+  console.log(`✅ Released slot. Active: ${activeScrapes}/${MAX_CONCURRENT_SCRAPES}`);
 }
 
-// Return page to pool or close it
-async function returnPage(page, fromPool) {
-  try {
-    if (fromPool && pagePool.length < PAGE_POOL_SIZE && !page.isClosed()) {
-      // Fast cleanup
-      await page.evaluate(() => {
-        document.querySelectorAll('[role="dialog"], .modal').forEach(el => el.remove());
-      }).catch(() => {});
-      
-      pagePool.push(page);
-    } else {
-      await page.close();
-    }
-  } catch (error) {
-    try { await page.close(); } catch {}
-  }
-}
-
-// Smart retry mechanism
+// Smart retry mechanism with queue management
 async function scrapeWithRetry(url, maxRetries = 2) {
-  let lastError;
+  // Wait for available slot
+  await waitForSlot();
   
-  for (let attempt = 1; attempt <= maxRetries; attempt++) {
-    let page = null;
-    let fromPool = false;
-    
-    try {
-      const pageInfo = await getPage();
-      page = pageInfo.page;
-      fromPool = pageInfo.fromPool;
-
-      console.log(`📄 Scraping ${url} (attempt ${attempt}/${maxRetries}, pool: ${fromPool})`);
-
-      // Playwright's optimized navigation
-      await page.goto(url, {
-        waitUntil: "domcontentloaded",
-        timeout: 20000,
-      });
-
-      // Wait for content with race condition
-      await Promise.race([
-        page.waitForFunction(
-          () => document.body.innerText.includes('التعليقات'),
-          { timeout: 3000 }
-        ).catch(() => {}),
-        page.waitForTimeout(4000)
-      ]);
-
-      console.log("✅ Page ready, extracting...");
-
-      // Extract comments count (Playwright evaluate is faster)
-      const commentsCount = await page.evaluate(() => {
-        const bodyText = document.body.innerText;
+  let lastError;
+  let page = null;
+  
+  try {
+    for (let attempt = 1; attempt <= maxRetries; attempt++) {
+      try {
+        await initBrowser();
         
-        // Fast regex (most common pattern first)
-        const match = bodyText.match(/التعليقات\s*\((\d+)\)/);
-        if (match) return parseInt(match[1], 10);
-        
-        // Fallback: element search
-        const h3Elements = document.getElementsByTagName('h3');
-        for (let i = 0; i < h3Elements.length; i++) {
-          const text = h3Elements[i].textContent;
-          if (text.includes('التعليقات')) {
-            const m = text.match(/\((\d+)\)/);
-            if (m) return parseInt(m[1], 10);
+        page = await browserContext.newPage();
+        await configurePage(page);
+
+        console.log(`📄 Scraping ${url} (attempt ${attempt}/${maxRetries})`);
+
+        // Navigate with timeout
+        await page.goto(url, {
+          waitUntil: "domcontentloaded",
+          timeout: 25000,
+        });
+
+        // Wait for content
+        await Promise.race([
+          page.waitForFunction(
+            () => document.body.innerText.includes('التعليقات'),
+            { timeout: 3000 }
+          ).catch(() => {}),
+          page.waitForTimeout(4000)
+        ]);
+
+        console.log("✅ Page ready, extracting...");
+
+        // Extract comments count
+        const commentsCount = await page.evaluate(() => {
+          const bodyText = document.body.innerText;
+          
+          // Fast regex
+          const match = bodyText.match(/التعليقات\s*\((\d+)\)/);
+          if (match) return parseInt(match[1], 10);
+          
+          // Fallback: element search
+          const h3Elements = document.getElementsByTagName('h3');
+          for (let i = 0; i < h3Elements.length; i++) {
+            const text = h3Elements[i].textContent;
+            if (text.includes('التعليقات')) {
+              const m = text.match(/\((\d+)\)/);
+              if (m) return parseInt(m[1], 10);
+            }
           }
+          
+          return 0;
+        });
+
+        console.log("🎯 Extracted:", commentsCount);
+
+        // Close page immediately
+        await page.close();
+        page = null;
+        
+        return commentsCount;
+
+      } catch (error) {
+        console.error(`❌ Attempt ${attempt} failed:`, error.message);
+        lastError = error;
+        
+        // Close page on error
+        if (page) {
+          try {
+            await page.close();
+          } catch {}
+          page = null;
         }
         
-        return 0;
-      });
-
-      console.log("🎯 Extracted:", commentsCount);
-
-      // Success! Return page to pool
-      await returnPage(page, fromPool);
-      
-      return commentsCount;
-
-    } catch (error) {
-      console.error(`❌ Attempt ${attempt} failed:`, error.message);
-      lastError = error;
-      
-      // Close page on error
-      if (page) {
-        try {
-          await page.close();
-        } catch {}
-      }
-      
-      // Exponential backoff
-      if (attempt < maxRetries) {
-        await new Promise(resolve => setTimeout(resolve, 1000 * attempt));
+        // Exponential backoff
+        if (attempt < maxRetries) {
+          await new Promise(resolve => setTimeout(resolve, 1500 * attempt));
+        }
       }
     }
+    
+    throw lastError;
+    
+  } finally {
+    // CRITICAL: Always release the slot
+    releaseSlot();
+    
+    // Ensure page is closed
+    if (page) {
+      try {
+        await page.close();
+      } catch {}
+    }
   }
-  
-  throw lastError;
 }
 
 // Scrape endpoint
@@ -316,7 +272,7 @@ app.get("/api/scrape/:requestId", async (req, res) => {
 
     const url = `https://khamsat.com/community/requests/${requestId}`;
 
-    // Scrape with retry
+    // Scrape with queue management
     const commentsCount = await scrapeWithRetry(url);
 
     // Store in cache
@@ -337,8 +293,8 @@ app.get("/api/scrape/:requestId", async (req, res) => {
       commentsCount,
       source: "live",
       responseTime,
-      poolSize: pagePool.length,
-      activeTabs: activeTabs.size,
+      activeScrapes,
+      maxConcurrent: MAX_CONCURRENT_SCRAPES,
       engine: "playwright",
       timestamp: new Date().toISOString(),
     });
@@ -359,8 +315,8 @@ app.get("/health", (req, res) => {
   res.json({
     status: "ok",
     browserConnected: browserInstance?.isConnected() || false,
-    poolSize: pagePool.length,
-    activeTabs: activeTabs.size,
+    activeScrapes,
+    maxConcurrent: MAX_CONCURRENT_SCRAPES,
     cacheSize: cache.size,
     engine: "playwright",
     timestamp: new Date().toISOString(),
@@ -372,13 +328,10 @@ app.post("/api/restart-browser", async (req, res) => {
   try {
     console.log("🔄 Restarting browser...");
     
-    // Close pool pages
-    for (const page of pagePool) {
-      try {
-        await page.close();
-      } catch {}
+    // Wait for active scrapes to finish
+    while (activeScrapes > 0) {
+      await new Promise(resolve => setTimeout(resolve, 500));
     }
-    pagePool.length = 0;
     
     // Close context and browser
     if (browserContext) {
@@ -393,12 +346,10 @@ app.post("/api/restart-browser", async (req, res) => {
     
     // Reinitialize
     await initBrowser();
-    await warmupPagePool();
     
     res.json({
       success: true,
-      message: "Browser restarted and pool warmed up",
-      poolSize: pagePool.length,
+      message: "Browser restarted",
       engine: "playwright",
       timestamp: new Date().toISOString(),
     });
@@ -425,14 +376,13 @@ app.post("/api/clear-cache", (req, res) => {
 async function shutdown() {
   console.log("🛑 Shutting down gracefully...");
   
-  // Close pool pages
-  for (const page of pagePool) {
-    try {
-      await page.close();
-    } catch {}
+  // Wait for active scrapes
+  while (activeScrapes > 0) {
+    console.log(`⏳ Waiting for ${activeScrapes} active scrapes...`);
+    await new Promise(resolve => setTimeout(resolve, 1000));
   }
   
-  // Close context and browser
+  // Close browser
   if (browserContext) {
     await browserContext.close();
   }
@@ -451,12 +401,12 @@ process.on("SIGINT", shutdown);
 app.listen(PORT, async () => {
   console.log(`🚀 Server running on http://localhost:${PORT}`);
   console.log(`📍 Scrape: http://localhost:${PORT}/api/scrape/:requestId`);
-  console.log(`⚡ Engine: Playwright (Ultra Fast Mode)`);
+  console.log(`⚡ Engine: Playwright (Railway Optimized)`);
+  console.log(`🔒 Max concurrent scrapes: ${MAX_CONCURRENT_SCRAPES}`);
   
-  // Initialize browser and warm up pages
+  // Initialize browser
   try {
     await initBrowser();
-    await warmupPagePool();
     console.log("✅ Server ready to handle requests!");
   } catch (error) {
     console.error("❌ Failed to initialize:", error);
