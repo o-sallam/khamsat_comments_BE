@@ -1,0 +1,43 @@
+[phases.setup]
+# Install system dependencies
+nixPkgs = [
+  'nodejs-18_x',
+  'chromium',
+  'python39',
+  'gcc',
+  'zlib',
+  'libcxx',
+  'nss',
+  'atk',
+  'at-spi2-atk',
+  'libxkbcommon',
+  'libdrm',
+  'libxcomposite',
+  'libxdamage',
+  'libxext',
+  'libxfixes',
+  'libxrandr',
+  'mesa',
+  'cups',
+  'dbus',
+  'gtk3',
+  'pango',
+  'cairo',
+  'gdk-pixbuf',
+  'pulseaudio',
+  'alsa-lib'
+]
+
+[phases.install]
+# Install Node.js dependencies
+cmds = [
+  'npm install'
+]
+
+[phases.build]
+# Build commands if needed
+cmds = []
+
+[start]
+# Start command
+cmd = 'node server.js'
