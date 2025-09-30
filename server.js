@@ -12,7 +12,7 @@ app.use(express.json());
 
 // Cache to store results
 const cache = new Map();
-const CACHE_DURATION = 10 * 60 * 1000; // 10 minutes
+const CACHE_DURATION = 30 * 1000; // 30 seconds
 
 // Browser management
 let browserInstance = null;
@@ -23,6 +23,8 @@ let browserInitializing = false;
 const MAX_CONCURRENT_SCRAPES = 3; // Railway can't handle more than 3 concurrent
 let activeScrapes = 0;
 const scrapeQueue = [];
+let lastRequestTime = 0;
+const REQUEST_DELAY = 500; // 500ms delay between requests
 
 // Initialize browser with Playwright
 async function initBrowser() {
@@ -136,6 +138,13 @@ async function configurePage(page) {
 
 // Queue management - CRITICAL for Railway stability
 async function waitForSlot() {
+  // Add delay between consecutive requests
+  const now = Date.now();
+  const timeSinceLastRequest = now - lastRequestTime;
+  if (timeSinceLastRequest < REQUEST_DELAY) {
+    await new Promise(resolve => setTimeout(resolve, REQUEST_DELAY - timeSinceLastRequest));
+  }
+  lastRequestTime = Date.now();
   while (activeScrapes >= MAX_CONCURRENT_SCRAPES) {
     await new Promise(resolve => setTimeout(resolve, 200));
   }
