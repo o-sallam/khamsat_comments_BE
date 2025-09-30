@@ -33,19 +33,18 @@ WORKDIR /app
 # Copy package files first for better caching
 COPY package*.json ./
 
-# Install dependencies (use npm install if no package-lock.json exists)
+# Install dependencies
 RUN npm install --omit=dev
 
-# Install Playwright and Chromium browser
-RUN npx playwright install --with-deps chromium
-
-# Copy application code
+# Copy application code BEFORE installing Playwright
 COPY . .
+
+# Install Playwright and Chromium browser AFTER copying app code
+# This ensures browsers are installed in the correct location
+RUN npx playwright install chromium --with-deps
 
 # Set environment variables for Railway
 ENV NODE_ENV=production
-ENV PLAYWRIGHT_BROWSERS_PATH=/ms-playwright
-ENV PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=0
 
 # Railway uses PORT environment variable
 EXPOSE ${PORT:-3001}
