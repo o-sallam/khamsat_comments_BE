@@ -33,8 +33,8 @@ WORKDIR /app
 # Copy package files first for better caching
 COPY package*.json ./
 
-# Install dependencies
-RUN npm ci --only=production
+# Install dependencies (use npm install if no package-lock.json exists)
+RUN npm install --omit=dev
 
 # Install Playwright and Chromium browser
 RUN npx playwright install --with-deps chromium
